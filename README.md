@@ -90,6 +90,127 @@ Alabama, `lambda = 6`, per-cut tolerance 2%, medians over random starts, seed 20
 A single flip moves about 0.5% of a district's population at tract scale against about
 10% at county scale, which is why flips alone stall on tracts and ReCom does not.
 
+## Exact enumeration (ZDD)
+
+`redistricting.enumerate` builds a zero-suppressed decision diagram (ZDD) of **every**
+partition of a unit graph into exactly p connected districts, following Fifield, Imai,
+Kawahara & Kenny (2020), "The Essential Role of Empirical Validation in Legislative
+Redistricting Simulation", sec. 2.3 (frontier-based search after Kawahara et al. 2017).
+
+```python
+from redistricting import Geo
+from redistricting.enumerate import PartitionZDD, population_ok
+g = Geo.load("IA_county", D=4)
+z = PartitionZDD(g.N, list(g.border), 4, order="best", xy=g.xy)
+z.count                                   # exact number of contiguous 4-partitions
+L = z.sample(100_000, rng)                # iid uniform plans, (M, N) labels
+L = L[population_ok(L, g.pop, 4, 0.05)]   # still uniform, now on plans within 5%
+```
+
+- **State.** A ZDD node stores the component labels of the frontier vertices, the
+  forbidden pairs (components joined by a cut edge, which may never merge) and the
+  number of finished districts. As in the paper, population is **not** in the state:
+  storing it stops nodes from merging. Population limits filter enumerated or sampled
+  plans afterwards, and a uniform sample filtered this way is uniform on the plans
+  that pass.
+- **Ordering (paper sec. 2.3.4).** `order_cut` implements the recursive minimum s-t
+  vertex cut. The paper finds s, t with Floyd-Warshall; on an unweighted graph one
+  BFS per vertex gives the same distances, and both are provided. Neither is a
+  bottleneck: Floyd-Warshall (scipy) takes 0.5 s on Alabama's 1,437 tracts. The
+  limit is the frontier: node counts grow about 8x per extra frontier vertex. No single
+  ordering wins everywhere, so `best_order` also tries BFS layering and coordinate
+  sweeps in 36 directions, and keeps the one with the smallest `sum_l 8^|F_l|`.
+
+  | max frontier | cut | BFS | best sweep |
+  |---|---|---|---|
+  | Iowa counties (99) | 12 | 11 | 10 |
+  | Alabama counties (67) | 10 | 9 | 9 |
+  | Iowa tracts (896) | 46 | 51 | - |
+  | Alabama tracts (1,437) | 47 | 81 | - |
+
+- **Validation** (`tests/test_zdd.py`). The enumerated partitions equal, as sets, those
+  found by an independent brute-force enumerator on grids, triangulated grids, wheels,
+  random Delaunay triangulations, trees and K5 (p = 1..4, both orderings); counts match
+  closed forms on paths, cycles, trees and complete graphs and a third, subset-based
+  count on the 4x4 grid (627). Every plan's sampling probability is exactly 1/count.
+- **How far it goes** (pure Python, about 5-10 us per node, `experiments/zdd_scaling.py`).
+  On random contiguous subsets of the Iowa tract map, grown as in the paper, with an
+  8M-node / 180 s budget: every 30-70 tract subset finished (at most 5.8M nodes, 82 s,
+  1.5 GB); at 85 and 100 tracts one of the two subsets finished and the other ran out
+  of budget. Node count tracks the frontier, not the number of units: a 40-tract
+  subset with frontier 9 took 2.6M nodes while a 70-tract one with frontier 7 took 85k.
+  p = 4 costs about 2.2x p = 2.
+  With the C++ backend and a 150M-node budget, on random pieces of 30-200 Iowa tracts:
+  **every piece with max frontier <= 12 finished** (largest: 100 tracts, frontier 12,
+  17.4M nodes, 6.7 s, 0.8 GB; a 120-tract piece with frontier 10 took 0.5 s), and
+  **every piece with frontier >= 13 ran out of budget**, including a 60-tract one. Size
+  in units is not the limit; frontier width is. 150- and 200-tract pieces had frontiers
+  of 14-18 and none finished.
+- **C++ backend.** `PartitionZDD(..., backend="cpp")` builds the same diagram with
+  `redistricting/enumerate/cpp/zdd_build.cpp` (compiled on first use through ctypes;
+  `python -m redistricting.enumerate._cpp` compiles it explicitly). It processes states
+  in the same order and canonical form as the Python builder, so the node arrays are
+  identical entry for entry, not just the counts: `tests/test_zdd_cpp.py` checks this
+  on grids, triangulations, wheels, trees, cycles, K6 and Iowa tract subsets for
+  p = 1..5. Ordering, counting and sampling are shared Python/numpy code. It is
+  30-47x faster and uses about a third of the memory.
+- **Iowa, 99 counties, 4 districts** (`experiments/zdd_sample.py`): the whole map
+  builds in 706 s and 4.5 GB in Python, **20 s and 1.6 GB in C++** (55.7M nodes, max
+  frontier 10 with a west-east sweep).
+  Exactly 944,051,457,824,193,030,004,001 (about 10^24) contiguous 4-partitions, which
+  matches the paper's "approximately 10^24". Of 5M uniform samples, 349 (7.0e-5) are
+  within 5% population deviation and 2 (4e-7) within 1%; the paper reports 7.2e-5 and
+  6e-7 from 500M samples on 2010 populations (ours are ACS).
+
+## MCMC validated against the ZDD
+
+`redistricting.mcmc.FlipChain` is single-flip Metropolis-Hastings with a **uniform**
+target over valid plans (p contiguous districts, each within `tol` of ideal
+population): propose a uniformly random boundary move (unit u, neighbouring district
+d), reject it if it breaks a constraint, else accept with probability
+`min(1, |B(x)| / |B(x')|)`, where B is the set of boundary moves. Tight tolerances can
+cut the valid plans into pieces that single flips cannot cross, so the chain walks
+within a looser `walk_tol` and keeps only the states within `tol`; that is still
+exactly uniform on the plans within `tol`. On a 3x3 grid and a 10-node triangulation,
+end states of 12,000 independent chains match the ZDD's enumeration (chi-square
+p = 0.76 and 0.30).
+
+**Does the MCMC distribution of each metric match the ZDD's?** Two-sample KS tests,
+MCMC against ZDD, population limit 5%. `experiments/mcmc_benchmark.py` and
+`experiments/mcmc_convergence.py`; statistics in `redistricting/stats.py`. Four chains
+start from extreme plans (least / most compact, lowest / highest D_race); the first
+20% of each is dropped. KS D uses every kept state. Because MCMC states are
+autocorrelated, the p-value is the median over all thinning offsets at a stride of
+3x the autocorrelation time.
+
+| metric | 70 tracts, 2 districts | 70 tracts, 3 districts | Iowa 99 counties, 4 districts |
+|---|---|---|---|
+| reference | all 464,122 valid plans (exact) | 100k iid ZDD samples | 5,000 iid ZDD samples |
+| MCMC | 4 x 4M steps, walk 10% | 4 x 12M steps, walk 10% | 4 x 50M steps, walk **20%** |
+| population deviation | D 0.005, p 0.55 | D 0.004, p 0.54 | D 0.011, p 0.79 |
+| compactness (mean Polsby-Popper) | D 0.006, p 0.44 | D 0.004, p 0.55 | D 0.025, p 0.14 |
+| D_race (minority vs white CVAP) | D 0.005, p 0.53 | D 0.005, p 0.57 | D 0.017, p 0.18 |
+| minority CVAP share, rank 1 | D 0.006, p 0.40 | D 0.004, p 0.67 | D 0.014, p 0.42 |
+| minority CVAP share, rank 2 | D 0.004, p 0.56 | D 0.002, p 0.46 | D 0.013, p 0.49 |
+| minority CVAP share, rank 3 / 4 | - | D 0.004, p 0.77 | D 0.007 / 0.012, p 0.33 / 0.78 |
+| D_education (BA+ vs not) | D 0.003, p 0.59 | D 0.006, p 0.34 | D 0.027, p 0.31 |
+| D_income stand-in (poverty) | D 0.003, p 0.44 | D 0.005, p 0.57 | D 0.015, p 0.22 |
+| pairwise variation of information | D 0.014, p 0.74 | D 0.010, p 0.22 | D 0.027, p 0.05 |
+
+The MCMC matches the ZDD on every metric in all three benchmarks, **but on Iowa only
+with walk_tol = 20%**. Walking within 10%, the chain does not converge: KS D for
+D_race stays at 0.10-0.13 and for minority-share ranks 2 and 4 at 0.12-0.15 from 5M
+to 50M steps per chain, while p-values fall towards 0 as the same bias is measured
+more precisely. At 20% the distances shrink to the reference's noise floor. The price
+is that only about 5% of the walk's states are within 5%, so 4 x 50M steps
+(about 1.5 CPU-hours per chain) yield 5,160 usable plans.
+
+Caveats: D_income uses people below vs above the poverty line, because a dissimilarity
+index needs income-group counts (ACS B19001) and the data has only tract medians.
+Race shares are CVAP, not VAP. The Iowa reference has only 5,000 plans (71M ZDD draws),
+which limits how small a difference the test can see. The paper's Republican
+dissimilarity index needs vote returns, which this repo does not have.
+
 ## Data
 
 Two CSVs per unit set `<name>` in `data/` (or `$REDISTRICTING_DATA`):
@@ -99,7 +220,15 @@ Two CSVs per unit set `<name>` in `data/` (or `$REDISTRICTING_DATA`):
 - `<name>_borders.csv`: `a, b, shared_km`, one row per adjacent pair.
 
 `data/` ships Alabama counties and tracts (`AL_county`, `AL_tract`), reduced to those
-columns. Regenerate borders from a TIGER/Line shapefile (adjacency and shared length by
+columns, and Iowa counties and tracts (`IA_county`, `IA_tract`), which also carry the
+count columns the plan statistics need (CVAP by race, BA+ of the 25+ population, people
+below poverty). Iowa counties are unions of tracts, built by `redistricting.prep`:
+
+```
+python -m redistricting.prep --state 19 --abbr IA \
+    --shp ../TIGER/tl_2026_19_tract/tl_2026_19_tract \
+    --master ../extracted/tract_master.csv --out data
+``` Regenerate borders from a TIGER/Line shapefile (adjacency and shared length by
 hashing identical boundary segments, no geometry library):
 
 ```
@@ -115,7 +244,7 @@ such as a shapefile in file order, must be re-keyed by GEOID, never by position.
 
 ```
 pip install -e ".[dev]"
-python -m pytest                     # 57 tests; 2 more run when REDISTRICTING_TIGER is set
+python -m pytest                     # 181 tests; 2 more run when REDISTRICTING_TIGER is set
 python -m redistricting.audit --unit AL_tract
 ```
 

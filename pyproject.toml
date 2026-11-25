@@ -7,7 +7,7 @@ name = "representation-redistricting"
 version = "0.1.0"
 description = "Compactness- and population-driven redistricting by local search on unit graphs"
 requires-python = ">=3.9"
-dependencies = ["numpy", "pandas"]
+dependencies = ["numpy", "pandas", "scipy", "networkx"]
 
 [project.optional-dependencies]
 dev = ["pytest"]
