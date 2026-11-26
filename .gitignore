@@ -7,3 +7,5 @@ outputs/
 .venv/
 *.so
 *.dylib
+
+data/states/

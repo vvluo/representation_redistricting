@@ -211,6 +211,127 @@ Race shares are CVAP, not VAP. The Iowa reference has only 5,000 plans (71M ZDD 
 which limits how small a difference the test can see. The paper's Republican
 dissimilarity index needs vote returns, which this repo does not have.
 
+## RL features and reward (`redistricting.rl`)
+
+Single-tract flips `a = (i, t)` move tract `i` to a neighbouring district `t`.
+`FlipFeatures` builds the action features `x(s, a)` and the objective changes behind
+the reward, for every boundary flip at once (about 7 ms per step for Iowa's 896 tracts
+at 50 districts):
+
+```python
+F = FlipFeatures(g, p=50, tol=0.05, alpha=0.25)
+st = F.state(assignment)
+acts, mask = F.actions(st)             # boundary flips; mask = contiguity + population
+X = F.features(st, acts)               # (A, 124) for Iowa today; names in F.names
+r = F.reward(X, {"poverty": 1, "ethnicity": 1, "industry": 1})
+st.apply(*acts[k])
+```
+
+**Reward.** `r(s, a) = w . dphi(s, a)`, where `dphi` is the change in each objective
+term: population (`-sum r_d^2`), compactness (mean Polsby-Popper), and one
+representation term per protected family that has data. Families are defined in
+`redistricting/rl/groups.py`:
+
+| Family | Groups | Data |
+|---|---|---|
+| poverty | below the poverty line | in the tract master |
+| ethnicity | Black, Hispanic, Asian, Native CVAP | in the tract master |
+| industry | the 13 ACS sectors | in the tract master |
+| rurality | micropolitan, small-town and rural tracts (RUCA 4–6, 7–9, 10) | in the tract master |
+| education | BA+; less than high school | BA+ in the master; less than high school needs B15003 |
+| income | households under $35k; $150k and over | B19001 |
+| class_of_worker | government, self-employed, non-profit workers | C24080 |
+| housing | renters, rent-burdened households, vacant units | B25003, B25070, B25002 |
+| health | uninsured | B27010 |
+| food | SNAP households | B22003 |
+| language | Spanish, other Indo-European, Asian/Pacific Island, other languages spoken at home | B16007 |
+| group_quarters | adult correctional, nursing-facility and college-housing residents | B26103 |
+
+A family switches on as soon as its count columns appear in the unit features, with
+no code change. The extra ACS tables come from `redistricting.acs` (variable codes
+checked against the 2024 ACS 5-year metadata). The Census API needs a free key
+(https://api.census.gov/data/key_signup.html), read from `CENSUS_API_KEY`:
+
+```
+python -m redistricting.acs --state 19 --out ../extracted/acs_api/IA_2024.csv
+python -m redistricting.prep --state 19 --abbr IA --shp ../TIGER/tl_2026_19_tract/tl_2026_19_tract \
+    --master ../extracted/tract_master.csv --acs ../extracted/acs_api/IA_2024.csv --out data
+```
+
+The same command takes `--state all`, or `--files` with data.census.gov ZIPs split any
+way (per table, per state). Pass the national output to
+`python -m redistricting.rl.groups --acs ...` to set these groups' thresholds from US
+tracts. Until then, their `tau` uses the same
+mean + 1 SD rule over the state's own tracts (`tau_source = "state_tracts"`). The family term is `-L`, where
+
+`L = (1/Z) sum_g sum_{m<=N_g} alpha^(m-1) max(0, 1 - s_g^(m) / tau_g)`
+
+- `s_g^(m)` is the `m`-th highest district share of group `g`.
+- `tau_g` is the share at which a district represents `g`. By default it is the US
+  tract mean + 1 SD, stored in `data/group_thresholds.csv`.
+- `N_g` is the number of representing districts the map can supply, a greedy lower
+  bound.
+
+Losing a group's only attainable district costs 1; merging two into one costs `alpha`.
+Groups the map cannot give a district (`N_g = 0`) carry no reward, and groups that
+every map represents contribute almost nothing. Because the reward is linear in the
+`dphi` block, a grid search over `w` only re-weights columns.
+
+**Feature blocks:**
+
+| Block | Contents |
+|---|---|
+| `dphi` | the changes above |
+| `tract` | the tract's population, income, poverty, race, education and industry shares |
+| `src`, `dst` | each district's deviation, compactness and composition, and its share of the tract's main group relative to `tau` |
+| `geo` | neighbours and shared-border fractions per district, outer boundary, distance to each district's centroid |
+| `community` | high-tract neighbours and high-tract cluster population in each district |
+| `consequence` | whether the flip fragments or reunites the tract's cluster, population slack, articulation |
+
+**Validation.** `tests/test_rl_features.py` checks every `dphi` against a from-scratch
+recomputation, the mask against BFS contiguity, and the incremental state against a
+rebuilt one.
+
+**Iowa at 50 districts.** No ethnic group is attainable at the US thresholds (34–37%
+CVAP), so the ethnicity term is zero there unless `tau` is lowered. Poverty has one
+attainable district. A greedy policy on `w = {poverty: 1}` raised a start's best
+poverty district from 24.1% to 26.0%, past `tau` = 25.4%, in 28 flips while staying
+within 5% population.
+
+### Environment (`redistricting.rl.env`)
+
+```python
+env = RedistrictingEnv("IA", "congress")        # any state; "congress" or "house"
+obs, info = env.reset(seed=0)                   # obs = {"x": (K, F) features, "mask": (K,)}
+obs, r, terminated, truncated, info = env.step(k)   # k indexes a legal flip
+```
+
+- **States and districts:** `redistricting.states` holds the congressional seats
+  (2020 apportionment) and the number of state-house districts (not seats). The
+  tolerance is ±1% for congress and ±5% for the house. Unit files are built on
+  demand from TIGER and the tract master into `data/states/`, and island components
+  are bridged.
+- **Actions:** only the legal flips, each one a row of `x(s, a)`. Contiguity is a hard
+  constraint, and no district may move outside the population tolerance, or further
+  outside it.
+- **Reward:** `w . dphi`, so an episode's return equals `J(final) - J(start)`.
+- **Resets:** maps are drawn from a cached starter pool (`rl/pool.py`) mixing five
+  initialisations, each balanced and then flip-repaired.
+- **Exploration band:** `explore_tol` (default = `tol`) is the band the mask
+  enforces on intermediate maps. Set it wider, e.g. `explore_tol=0.05` for congress,
+  and maps may leave `tol` mid-episode while the `excess` term, `-sum_d max(0, |r_d| -
+  tol)`, pulls them back. `tol` stays the requirement for a valid map, and the tracked
+  best map is always within `tol`.
+- **Episode end:** at `horizon` flips (truncated) or when no legal flip remains
+  (terminated). `info` carries the best map seen.
+- **Evaluation:** `env.evaluate(map)` reports the objective terms, constraint status
+  and the cracking table. A group counts as cracked when `N_g >= 1` but no district
+  reaches `tau_g`.
+
+State houses on tracts: 19 states have fewer than 10 tracts per house district, and
+there the flip repair cannot reach ±5%. Iowa's house plans stall at 59–155% deviation.
+`strict_pool=False` keeps such starts for development; block groups are the fix.
+
 ## Data
 
 Two CSVs per unit set `<name>` in `data/` (or `$REDISTRICTING_DATA`):
@@ -222,7 +343,7 @@ Two CSVs per unit set `<name>` in `data/` (or `$REDISTRICTING_DATA`):
 `data/` ships Alabama counties and tracts (`AL_county`, `AL_tract`), reduced to those
 columns, and Iowa counties and tracts (`IA_county`, `IA_tract`), which also carry the
 count columns the plan statistics need (CVAP by race, BA+ of the 25+ population, people
-below poverty). Iowa counties are unions of tracts, built by `redistricting.prep`:
+below poverty, employed residents and workers in each of the 13 ACS industry sectors). Iowa counties are unions of tracts, built by `redistricting.prep`:
 
 ```
 python -m redistricting.prep --state 19 --abbr IA \
@@ -243,8 +364,8 @@ such as a shapefile in file order, must be re-keyed by GEOID, never by position.
 ## Tests
 
 ```
-pip install -e ".[dev]"
-python -m pytest                     # 181 tests; 2 more run when REDISTRICTING_TIGER is set
+pip install -e ".[dev,rl]"
+python -m pytest                     # 206 tests; 2 more run when REDISTRICTING_TIGER is set
 python -m redistricting.audit --unit AL_tract
 ```
 
@@ -259,8 +380,11 @@ python -m redistricting.audit --unit AL_tract
 
 ## Not in this repo yet
 
-- Feature-matrix builders for the ACS/CVAP/industry columns (this package reads only
-  population, area, perimeter and, optionally, centroids).
+- The ACS tables for income, class of worker, education below high school, housing,
+  health insurance and SNAP (B19001, C24080, B15003, B25003/B25070/B25002, B27010,
+  B22003, B16007, B26103). Their families switch on once prep carries the columns.
+- A starter-map pool for RL resets. `balance` rarely reaches 5% at 50 Iowa districts;
+  a greedy flip repair on `d_population` closes the gap.
 - The adapter for the `Flip_ReCom_LocalSearch` data (IL, MO, TN) and the page builders
   used to visualise results.
 - The lambda sweep and the 1,000-run score-distribution analysis, which so far exist
