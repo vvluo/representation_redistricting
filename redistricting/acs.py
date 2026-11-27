@@ -44,6 +44,7 @@ Two ways in:
     python -m redistricting.acs --state 19 --out ../extracted/acs_api/IA_2024.csv
     python -m redistricting.acs --files ~/Downloads/ACSDT5Y2024.*.zip --out ../extracted/acs_api/IA_2024.csv
     python -m redistricting.acs --state all --out ../extracted/acs_api/US_2024.csv   # national
+    python -m redistricting.acs --state all --p5 --out ../extracted/acs_api/US_2020_P5.csv
 
 Files may be split any way (one ZIP per table per state, or several of each); rows
 stack across states and columns join across tables.  For national thresholds:
@@ -94,8 +95,15 @@ SPEC = {
 TABLES = sorted({v.split("_")[0] for add, sub in SPEC.values() for v in add + sub})
 
 
-def variables():
-    return sorted({v for add, sub in SPEC.values() for v in add + sub})
+# Tables the 5-year release does not publish for tracts (B26103 stops at states in 2024);
+# the API would reject a whole request containing them.  Tract group-quarters counts
+# need the 2020 decennial table P5 instead.
+NO_TRACT = {"B26103"}
+
+
+def variables(tract=True):
+    return sorted({v for add, sub in SPEC.values() for v in add + sub
+                   if not (tract and v.split("_")[0] in NO_TRACT)})
 
 
 STATES = ["01", "02", "04", "05", "06", "08", "09", "10", "11", "12", "13", "15", "16", "17",
@@ -104,15 +112,61 @@ STATES = ["01", "02", "04", "05", "06", "08", "09", "10", "11", "12", "13", "15"
           "47", "48", "49", "50", "51", "53", "54", "55", "56", "72"]   # 50 states, DC, PR
 
 
-def fetch(state, year=2024, key=None, chunk=45):
-    """Raw estimates for every tract in a state: DataFrame with geoid + variables."""
+# Group quarters for tracts: 2020 Census redistricting file (PL 94-171), table P5, a
+# full count.  Same column names as the B26103 groups, so redistricting.rl.groups picks
+# them up unchanged; gq_pop_total is the tract's total population (as B26103_001 is).
+P5_SPEC = {
+    "gq_pop_total": "P1_001N",       # total population
+    "gq_total": "P5_001N",           # all group quarters
+    "gq_correctional": "P5_003N",    # correctional facilities for adults
+    "gq_nursing": "P5_005N",         # nursing / skilled-nursing facilities
+    "gq_college": "P5_008N",         # college / university student housing
+    "gq_military": "P5_009N",        # military quarters
+}
+
+
+def fetch_p5(state, key=None):
+    """2020 PL 94-171 group-quarters counts for every tract in a state."""
+    raw = fetch(state, key=key, dataset="2020/dec/pl", V=sorted(set(P5_SPEC.values())))
+    out = raw[["geoid"]].copy()
+    for col, v in P5_SPEC.items():
+        out[col] = raw[v].where(raw[v] >= 0)
+    return out
+
+
+def remap_ct(D, current_geoids):
+    """Re-key Connecticut tracts from 2020 county codes to the 2022 planning-region codes
+    used by ACS 2022+ and TIGER 2022+.  The 6-digit tract number was kept, so match on it
+    where it is unique (the duplicates are zero-population water tracts)."""
+    cur = pd.Series([g for g in current_geoids if g.startswith("09")])
+    cur = cur[~cur.str[5:].duplicated(keep=False)]
+    new = dict(zip(cur.str[5:], cur))
+    ct = D.geoid.str.startswith("09")
+    tr = D.loc[ct, "geoid"].str[5:]
+    dup = tr.duplicated(keep=False)
+    D = D.copy()
+    D.loc[ct, "geoid"] = [new.get(t, g) if not d else g for t, g, d in zip(tr, D.loc[ct, "geoid"], dup)]
+    return D
+
+
+def _tiger_geoids(fips):
+    """Current tract GEOIDs of one state from ../TIGER (empty if not there)."""
+    from redistricting.shapefile import read_dbf
+    d = sorted((Path(__file__).resolve().parents[2] / "TIGER").glob(f"tl_*_{fips}_tract"))
+    return [r["GEOID"] for r in read_dbf(str(d[-1] / d[-1].name) + ".dbf")] if d else []
+
+
+def fetch(state, year=2024, key=None, chunk=45, dataset=None, V=None):
+    """Raw estimates for every tract in a state: DataFrame with geoid + variables.
+    dataset defaults to the ACS 5-year release of `year`; V to the SPEC variables."""
     key = key or os.environ.get("CENSUS_API_KEY")
     if not key:
         raise SystemExit("set CENSUS_API_KEY (free key: https://api.census.gov/data/key_signup.html)")
-    V = variables(); out = None
+    V = V or variables(); out = None
+    dataset = dataset or f"{year}/acs/acs5"
     for k in range(0, len(V), chunk):
         q = {"get": ",".join(V[k:k + chunk]), "for": "tract:*", "in": f"state:{int(state):02d}", "key": key}
-        url = f"https://api.census.gov/data/{year}/acs/acs5?" + urllib.parse.urlencode(q, safe=":*,")
+        url = f"https://api.census.gov/data/{dataset}?" + urllib.parse.urlencode(q, safe=":*,")
         with urllib.request.urlopen(url, timeout=60) as r:
             body = r.read().decode()
         if not body.startswith("["):
@@ -174,6 +228,8 @@ def derive(raw):
     R = R.where(R >= 0)
     out = pd.DataFrame(index=R.index)
     for col, (add, sub) in SPEC.items():
+        if not set(add + sub) <= set(R.columns):
+            continue                                    # table not fetched (e.g. NO_TRACT)
         v = R[add].sum(axis=1, min_count=1)
         if sub:
             v = v - R[sub].fillna(0).sum(axis=1)
@@ -189,7 +245,24 @@ def main():
     ap.add_argument("--year", type=int, default=2024)
     ap.add_argument("--out", required=True)
     ap.add_argument("--raw-out", help="also keep the raw variables")
+    ap.add_argument("--p5", action="store_true",
+                    help="fetch 2020 Census P5 group quarters (tracts) instead of the ACS tables")
     A = ap.parse_args()
+    if A.p5:
+        if not A.state:
+            raise SystemExit("--p5 needs --state")
+        states = STATES if A.state == ["all"] else A.state
+        D = pd.concat([fetch_p5(s) for s in states], ignore_index=True)
+        if (D.geoid.str[:2] == "09").any():
+            cur = _tiger_geoids("09")
+            if cur:
+                D = remap_ct(D, cur)
+            else:
+                print("warning: no ../TIGER Connecticut tracts; CT keeps 2020 county codes")
+        Path(A.out).parent.mkdir(parents=True, exist_ok=True)
+        D.to_csv(A.out, index=False)
+        print(f"{len(D)} tracts (2020 counts; CT re-keyed to planning regions), {len(P5_SPEC)} P5 columns -> {A.out}")
+        return
     if A.files:
         paths = [q for p in A.files for q in (glob.glob(os.path.expanduser(p)) or [p])]
         raw = load_files(paths)
@@ -201,7 +274,8 @@ def main():
     D = derive(raw)
     Path(A.out).parent.mkdir(parents=True, exist_ok=True)
     D.to_csv(A.out, index=False)
-    print(f"{len(D)} tracts, {len(SPEC)} columns from {', '.join(TABLES)} -> {A.out}")
+    got = sorted({v.split("_")[0] for v in raw.columns if "_" in v})
+    print(f"{len(D)} tracts, {len(D.columns) - 1} columns from {', '.join(got)} -> {A.out}")
 
 
 if __name__ == "__main__":

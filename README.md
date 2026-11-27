@@ -332,6 +332,43 @@ State houses on tracts: 19 states have fewer than 10 tracts per house district, 
 there the flip repair cannot reach ±5%. Iowa's house plans stall at 59–155% deviation.
 `strict_pool=False` keeps such starts for development; block groups are the fix.
 
+### DQN and Double DQN (`experiments/train_dqn.py`, `redistricting/rl/qnet.py`)
+
+`h_theta(s, a) = MLP(x(s, a))` (CleanRL's 120 → 84 layers) and
+`Q_theta(s, a) = w_Q^T h_theta(s, a) + b_Q`. The network scores each legal flip's row,
+so the greedy action is an argmax over legal rows.
+
+| `--algo` | TD target |
+|---|---|
+| `dqn` | `r + γ max_a' Q_online(s', a')`, no target network |
+| `dqn --target-network` | `r + γ max_a' Q_target(s', a')`, as in `cleanrl/dqn.py` |
+| `ddqn` | `r + γ Q_target(s', argmax_a' Q_online(s', a'))` |
+
+The target network is a delayed copy, updated every 500 steps with `tau = 1`. The loop
+and defaults follow `cleanrl/dqn.py`: Adam 2.5e-4, MSE loss, γ 0.99, batch 128, ε
+decaying linearly from 1 to 0.05, and a training step every 10 environment steps. A
+truncated episode bootstraps; a terminated one does not.
+
+Features are standardised, and rewards rescaled, once from a short random rollout.
+The replay buffer keeps the taken action's row and the next state's legal rows. Each
+run writes `outputs/runs/<run>/` and ends by evaluating the learned greedy policy
+against greedy best-improvement from the same starts.
+
+### Weight grid (`experiments/weight_grid.py`)
+
+Compactness is fixed at weight 1. Two families get weights `(a, b)` on a grid, using
+either their quota terms or their cohesion terms. Every term is scaled by the std of
+its per-move change, so weight 1 means "counts as much as compactness". Greedy runs
+from held-out starts, and each grid point reports groups cracked, cohesion,
+compactness and validity, with a heatmap (`outputs/weight_grid/`).
+
+On Iowa congress (rurality × industry), the quota weights cut cracking: rurality 0.88
+→ 0.12 and industry 2.69 → 1.5 groups, with compactness falling from 0.31 to as low as
+0.20. Cohesion weights raise cohesion but leave cracking unchanged. In Alabama, greedy
+lifts the best poverty district from about 0.18–0.19 to 0.20–0.23 but never reaches
+`tau` = 0.254 within 1% tolerance. That is the case an optimizer stronger than greedy
+has to solve.
+
 ## Data
 
 Two CSVs per unit set `<name>` in `data/` (or `$REDISTRICTING_DATA`):
@@ -365,7 +402,7 @@ such as a shapefile in file order, must be re-keyed by GEOID, never by position.
 
 ```
 pip install -e ".[dev,rl]"
-python -m pytest                     # 206 tests; 2 more run when REDISTRICTING_TIGER is set
+python -m pytest                     # 212 tests; 2 more run when REDISTRICTING_TIGER is set
 python -m redistricting.audit --unit AL_tract
 ```
 

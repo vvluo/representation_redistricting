@@ -117,11 +117,12 @@ def default_groups(columns):
 # ------------------------------------------------------------------ thresholds
 def national_thresholds(master_csv, acs_csv=None):
     """US tract mean + 1 SD of each group's share, over tracts with a denominator.
-    acs_csv: national output of redistricting.acs, adding the extra ACS groups."""
+    acs_csv: national output(s) of redistricting.acs (ACS tables, 2020 P5 group quarters),
+    adding their groups; a path or a list of paths."""
     M = derive_counts(pd.read_csv(master_csv, dtype={"geoid": str}))
-    if acs_csv:
-        X = pd.read_csv(acs_csv, dtype={"geoid": str})
-        M = M.merge(X, on="geoid", how="left")
+    for f in ([acs_csv] if isinstance(acs_csv, (str, Path)) else acs_csv or []):
+        X = pd.read_csv(f, dtype={"geoid": str})
+        M = M.merge(X.drop(columns=[c for c in X if c in M and c != "geoid"]), on="geoid", how="left")
     rows = []
     for g in default_groups(M.columns):
         den = M[g.den]; ok = den > 0
@@ -217,7 +218,7 @@ def build_groups(g, p, tol=0.05, tau=None, families=None, thresholds=None):
 def main():
     ap = argparse.ArgumentParser(description="write data/group_thresholds.csv")
     ap.add_argument("--master", required=True)
-    ap.add_argument("--acs", help="national redistricting.acs output (optional)")
+    ap.add_argument("--acs", nargs="+", help="national redistricting.acs output(s) (optional)")
     ap.add_argument("--out", default=str(config.data_dir() / "group_thresholds.csv"))
     A = ap.parse_args()
     T = national_thresholds(A.master, A.acs)

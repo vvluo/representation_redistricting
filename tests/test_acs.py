@@ -6,7 +6,7 @@ from redistricting.acs import SPEC, derive, variables
 
 
 def test_derive_sums_and_sentinels():
-    V = variables()
+    V = variables(tract=False)                      # every table, incl. state-only B26103
     raw = pd.DataFrame([{**{v: 1.0 for v in V}, "geoid": "19001000100"},
                         {**{v: 2.0 for v in V}, "geoid": "19001000200"}])
     raw.loc[1, "B25070_011E"] = 5.0                 # 'not computed' renters
@@ -21,6 +21,9 @@ def test_derive_sums_and_sentinels():
     assert D.loc["19001000100", "lang_spanish"] == 3          # three age bands
     assert D.loc["19001000100", "gq_college"] == 1
     assert set(D.columns) == set(SPEC)
+    # tract fetches leave out B26103; its columns are skipped, not an error
+    T = derive(raw[["geoid"] + variables()]).set_index("geoid")
+    assert "gq_college" not in T and "snap_hh" in T
 
 
 def test_every_numerator_has_its_denominator():
@@ -88,3 +91,11 @@ def test_national_thresholds_with_acs(tmp_path):
     sh = np.array([0.1, 0.2, 0.6])
     assert T.loc["snap", "tau"] == pytest.approx(sh.mean() + sh.std(ddof=1))
     assert "poverty" in T.index
+
+
+def test_remap_ct_keeps_tract_number():
+    from redistricting.acs import remap_ct
+    D = pd.DataFrame({"geoid": ["09001010100", "09003990000", "09009990000", "19001000100"], "x": [1, 2, 3, 4]})
+    cur = ["09190010100", "09110990000", "09170990000"]          # 2022 planning-region codes
+    R = remap_ct(D, cur)
+    assert R.geoid.tolist() == ["09190010100", "09003990000", "09009990000", "19001000100"]  # dup water tracts kept

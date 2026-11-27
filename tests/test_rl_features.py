@@ -133,3 +133,15 @@ def test_derive_counts():
     D = derive_counts(M)
     assert D.pop_micropolitan.tolist() == [0, 50, 0] and D.pop_rural.tolist() == [0, 0, 10]
     assert np.allclose(D[[f"ind_{k:02d}" for k in range(1, 14)]].sum(axis=1), M.emp_total)
+
+
+def test_cohesion_definition(setup):
+    g, F, a = setup
+    assert "d_coh_poverty" in F.names
+    k = [gr.name for gr in F.groups].index("poverty")
+    f = F.tshare[:, k]
+    E = [(i, j, L) for (i, j), L in g.border.items()]
+    num = sum(L * f[i] * f[j] for i, j, L in E if a[i] == a[j])
+    den = sum(L * f[i] * f[j] for i, j, L in E)
+    assert F.phi(F.state(a))["coh_poverty"] == pytest.approx(num / den, rel=1e-9)
+    assert 0 <= F.phi(F.state(a))["coh_poverty"] <= 1

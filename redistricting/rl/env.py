@@ -167,7 +167,15 @@ class RedistrictingEnv(gym.Env):
         phi = self.F.phi(st)
         rows, fam = self.F.representation(st)
         r = st.sums[:, 0] / self.F.ideal - 1
+        pp = self.F._pp(st.sums[:, 1], st.perim)
+        sh = self.F._shares(st.sums, self.F.ix_gnum, self.F.ix_gden).T           # (G, p)
+        rep_pp = {}
+        for f in self.F.families:                    # districts at tau for an attainable group
+            ks = [k for k in self.F.fam_idx[f] if self.F.groups[k].N >= 1]
+            ds = sorted({d for k in ks for d in np.flatnonzero(sh[k] >= self.F.groups[k].tau)})
+            rep_pp[f] = float(np.mean(pp[ds])) if ds else None
         return {"phi": phi, "J": self.J(phi), "max_dev": float(np.abs(r).max()),
+                "district_pp": pp.tolist(), "min_pp": float(pp.min()), "rep_pp": rep_pp,
                 "within_tol": bool(np.abs(r).max() <= self.tol + 1e-12),
                 "contiguous": all(_connected(np.flatnonzero(st.a == d), self.g.nbr) for d in range(self.p)),
                 "families": fam, "groups": rows}

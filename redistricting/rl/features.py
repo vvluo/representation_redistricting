@@ -29,6 +29,11 @@ dphi = phi(s') - phi(s) under each action:
                reaches tau, 1 = none has any of the group
 
   Losing a group's only district costs weight 1; merging two into one costs alpha.
+
+  coh_<family> border cohesion, an alternative to the quota term: per group
+      C_g(z) = sum_E b_ij f_i f_j 1[z_i = z_j] / sum_E b_ij f_i f_j
+  (b_ij shared border length, f_i the group's share of tract i), averaged over the
+  family's groups.  1 = no border between the group's tracts is cut.
   A group that neutral maps always represent (N_g reached anyway) contributes ~0.
 
 Reward: r(s, a) = sum_k w_k dphi_k over the chosen terms -- a linear function of the
@@ -157,6 +162,17 @@ class FlipFeatures:
         self.deg = np.bincount(self.du, minlength=g.N).astype(float)
         self.outer = np.maximum(g.perim - np.bincount(self.du, self.dl, g.N), 0.0)
         # high-neighbour weights: v is high in u's main group of the family
+        # border cohesion: per group w_ij = b_ij f_i f_j / sum_E b f f; family weight = mean over
+        # its groups with a non-zero denominator (undirected sum over E = directed sum / 2)
+        self.cohw = {}
+        for f in self.families:
+            W = np.zeros_like(self.dl); n = 0
+            for k in self.fam_idx[f]:
+                w = self.dl * self.tshare[self.du, k] * self.tshare[self.dv, k]
+                Zk = w.sum() / 2
+                if Zk > 0:
+                    W += w / Zk; n += 1
+            self.cohw[f] = W / n if n else W
         self.hiw = {}
         for f in self.families:
             gs = self.gstar[f][self.du]
@@ -179,7 +195,7 @@ class FlipFeatures:
                             + [f"{pre}_{c}" for c in comp]
                             + [f"{pre}_{f}_share_over_tau" for f in fam]
                             + [f"{pre}_{f}_in_topN" for f in fam])
-        B = {"dphi": ["d_population", "d_compactness"] + [f"d_{f}" for f in fam] + ["d_maxdev", "d_excess"],
+        B = {"dphi": ["d_population", "d_compactness"] + [f"d_{f}" for f in fam] + ["d_maxdev", "d_excess"] + [f"d_coh_{f}" for f in fam],
              "tract": ["pop_over_ideal", "log_income"] + [f"t_{c}" for c in comp] + [f"t_{n}" for n in ind]
                       + [f"t_{f}_share_over_tau" for f in fam],
              "src": dist("src"), "dst": dist("dst"),
@@ -255,6 +271,9 @@ class FlipFeatures:
                 out[f] = 0.0; continue
             v = srt[ks][:, :self.Nmax] if self.Nmax <= p else srt[ks]
             out[f] = -float(self._hinge(v, ks)) / self.Z[f]
+        same = a[self.du] == a[self.dv]
+        for f in self.families:
+            out[f"coh_{f}"] = float(self.cohw[f][same].sum() / 2)
         return out
 
     def _dphi(self, st, acts):
@@ -299,6 +318,9 @@ class FlipFeatures:
         out.append(d_max)
         ex = lambda x: np.maximum(np.abs(x) - self.tol, 0.0)
         out.append(-(ex(rs1) + ex(rt1) - ex(r[s]) - ex(r[t])))
+        for f in self.families:                     # edges to t become internal, edges to s cut
+            nb = self._nb(st, self.cohw[f])
+            out.append(nb[i, t] - nb[i, s])
         return np.column_stack(out), dict(Ss=Ss, St=St, rs1=rs1, rt1=rt1, Ls=Ls, Lt=Lt, sh=sh, nb_len=nb_len)
 
     def _nb(self, st, w):
