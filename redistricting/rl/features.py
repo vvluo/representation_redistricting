@@ -211,6 +211,18 @@ class FlipFeatures:
             self.blocks[b] = slice(o, o + len(nm)); self.names += nm; o += len(nm)
         self.dim = o
 
+        # state features x_state(s): the parts of x(s, a) that describe the map rather
+        # than one candidate flip, summarised over all districts (see state_features)
+        per = ["dev", "absdev", "pp", "log_income"] + comp
+        SB = {"districts": [f"{st}_{c}" for c in per for st in ("mean", "std", "min", "max")],
+              "family": sum([[f"{f}_frac_represented", f"{f}_mean_top_share_over_tau"] for f in fam], []),
+              "phi": ["population", "compactness"] + list(fam) + ["maxdev", "excess"] + [f"coh_{f}" for f in fam],
+              "time": ["t_over_horizon"]}
+        self.state_names, self.state_blocks, o = [], {}, 0
+        for b, nm in SB.items():
+            self.state_blocks[b] = slice(o, o + len(nm)); self.state_names += nm; o += len(nm)
+        self.state_dim = o
+
     # ------------------------------------------------------------------ state
     def state(self, a):
         return DistrictState(self.g, a, self.p, self.C, self.clusters)
@@ -391,6 +403,45 @@ class FlipFeatures:
         X = np.column_stack(cols)
         assert X.shape == (A, self.dim)
         return X
+
+    # ------------------------------------------------------------------ state features
+    def state_features(self, st, phi=None, t_frac=0.0):
+        """x_state(s), one vector per map (names in self.state_names, slices in
+        self.state_blocks).  Nothing in it depends on a candidate flip:
+
+          districts  the district descriptors of the src / dst blocks (signed and
+                     absolute deviation, Polsby-Popper, log income, composition),
+                     for every district, as mean / std / min / max over districts
+                     (invariant to district labels and the same length for any p)
+          family     per family, over its attainable groups (N_g >= 1): the fraction
+                     with a district at tau, and the mean over groups and their top
+                     N_g districts of share / tau (the hinge's inputs; the state-level
+                     counterpart of {src,dst}_<family>_share_over_tau and _in_topN)
+          phi        the objective levels phi_k(s) whose changes are the dphi block
+                     (from `phi`, a dict as returned by phi(); zeros if None)
+          time       t / horizon
+        """
+        S = st.sums; r = S[:, 0] / self.ideal - 1
+        pp = self._pp(S[:, 1], st.perim)
+        inc = np.where(S[:, 0] > 0, S[:, 4] / np.maximum(S[:, 0], 1e-12), 0.0)
+        comp = self._shares(S, self.ix_cnum, self.ix_cden)
+        D = np.column_stack([r, np.abs(r), pp, inc, comp])               # (p, 4 + Q)
+        agg = np.stack([D.mean(0), D.std(0), D.min(0), D.max(0)], axis=1).ravel()
+        sh = self._shares(S, self.ix_gnum, self.ix_gden).T              # (G, p)
+        srt = -np.sort(-sh, axis=1)
+        fam = []
+        for f in self.families:
+            ks = [k for k in self.fam_idx[f] if self.Ng[k] >= 1 and np.isfinite(self.tau[k])]
+            if not ks:
+                fam += [0.0, 0.0]; continue
+            fam.append(float(np.mean(srt[ks, 0] >= self.tau[ks])))
+            top = [srt[k, :self.Ng[k]] / self.tau[k] for k in ks]
+            fam.append(float(np.mean(np.concatenate(top))))
+        ph = self.state_names[self.state_blocks["phi"]]
+        ph = [float(phi[n]) for n in ph] if phi is not None else [0.0] * len(ph)
+        x = np.concatenate([agg, fam, ph, [t_frac]])
+        assert x.shape == (self.state_dim,)
+        return x
 
     # ------------------------------------------------------------------ reward
     def reward(self, X, w):

@@ -8,7 +8,9 @@ State       an assignment of every tract to one of p districts (p, tolerance and
             from redistricting.states: any state, congress or house).
 Actions     the LEGAL flips (i, t) of the current state, listed in obs["x"] (one row of
             features x(s, a) each, see features.py) and padded to max_actions;
-            obs["mask"][k] = 1 for real rows.  The action is the row index.  Legal =
+            obs["mask"][k] = 1 for real rows.  obs["s"] is x_state(s), the map's
+            features that belong to no single flip (FlipFeatures.state_features;
+            for a critic V(s)).  The action is the row index.  Legal =
             source district stays non-empty and connected (hard contiguity) and no
             district moves outside the exploration band `explore_tol`, or further
             outside it.  explore_tol defaults to tol (every visited map valid); set it
@@ -72,7 +74,8 @@ class RedistrictingEnv(gym.Env):
         self.max_actions = int(max_actions)
         self.observation_space = spaces.Dict({
             "x": spaces.Box(-np.inf, np.inf, (self.max_actions, self.F.dim), np.float32),
-            "mask": spaces.MultiBinary(self.max_actions)})
+            "mask": spaces.MultiBinary(self.max_actions),
+            "s": spaces.Box(-np.inf, np.inf, (self.F.state_dim,), np.float32)})
         self.action_space = spaces.Discrete(self.max_actions)
         self.st = None
 
@@ -105,7 +108,8 @@ class RedistrictingEnv(gym.Env):
         self.cand_dphi = X[:, self.F.blocks["dphi"]]
         x = np.zeros((self.max_actions, self.F.dim), np.float32); x[:len(acts)] = X
         m = np.zeros(self.max_actions, np.int8); m[:len(acts)] = 1
-        return {"x": x, "mask": m}
+        s = self.F.state_features(self.st, self.phi_now, self.t / self.horizon).astype(np.float32)
+        return {"x": x, "mask": m, "s": s}
 
     def _info(self, invalid=False):
         _, fam = self.F.representation(self.st)
@@ -124,7 +128,8 @@ class RedistrictingEnv(gym.Env):
             a = self.pool[self.np_random.integers(len(self.pool)) if "index" not in options else options["index"]]
         self.st = self.F.state(a); self.t = 0
         self.start_assignment = self.st.a.copy()
-        self.J_now = self.J(self.F.phi(self.st))
+        self.phi_now = self.F.phi(self.st)          # objective levels, updated by each move's dphi
+        self.J_now = self.J(self.phi_now)
         self.best_J, self.best_assignment = (self.J_now, self.st.a.copy()) if self._within() \
             else (-np.inf, None)
         obs = self._observe()
@@ -141,6 +146,8 @@ class RedistrictingEnv(gym.Env):
         dphi = dict(zip([n[2:] for n in self.F.names[self.F.blocks["dphi"]]], self.cand_dphi[action]))
         self.st.apply(i, t); self.t += 1
         self.J_now += reward
+        for k, v in dphi.items():
+            self.phi_now[k] += float(v)
         if self.J_now > self.best_J + 1e-12 and self._within():
             self.best_J, self.best_assignment = self.J_now, self.st.a.copy()
         obs = self._observe(); self._last_obs = obs
